@@ -1,0 +1,22 @@
+[package]
+authors = ["Christopher Sardegna <imessage@reagentx.net>"]
+categories = ["database"]
+description = "Parsers and tools to interact with iMessage SQLite data"
+edition = "2024"
+exclude = [".github", "docs", "build.sh"]
+license = "GPL-3.0-or-later"
+name = "imessage-database"
+repository = "https://github.com/ReagentX/imessage-exporter"
+version = "0.0.0"
+
+[dependencies]
+chrono = "=0.4.41"
+plist = "=1.7.1"
+rusqlite = { version = "=0.36.0", features = ["blob", "bundled"] }
+sha1 = "=0.10.6"
+protobuf = "=3.7.2"
+lzma-rs = "=0.3.0"
+
+[build-dependencies]
+protobuf = "=3.7.2"
+protobuf-codegen = "=3.7.2"
