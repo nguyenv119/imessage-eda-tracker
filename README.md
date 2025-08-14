@@ -1,6 +1,6 @@
 # 🕵️ iMessage EDA Tracker
 
-Event-driven monitor that detects and preserves deleted iMessages
+Event-driven monitor that detects and preserves deleted iMessages. Initially was supposed to be another project, but oh well
 
 ## 🎯 What It Does
 
