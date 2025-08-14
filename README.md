@@ -1,4 +1,4 @@
-# 🕵️ iMessage Deletion Tracker
+# 🕵️ iMessage EDA Tracker
 
 Event-driven monitor that detects and preserves deleted iMessages
 
