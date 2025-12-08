@@ -32,9 +32,11 @@ impl DeletionTracker {
         // Initialize components
         let event_processor = EventProcessor::new(config.database.clone());
         let state_manager = Arc::new(RwLock::new(
-            StateManager::new(config.state.clone()).await?
+            StateManager::new(config.state.clone()).await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?
         ));
-        let detection_engine = DetectionEngine::new(config.detection.clone());
+        let detection_engine = DetectionEngine::new(config.detection.clone())
+            .with_db_path(config.database.imessage_db_path.clone());
         let output_manager = Arc::new(RwLock::new(
             OutputManager::new(&config.outputs)?
         ));
@@ -53,12 +55,14 @@ impl DeletionTracker {
 
     /// Start the async deletion tracking loop
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("🚀 Starting iMessage deletion tracker with new architecture...");
-        info!("📊 Monitoring: {:?}", self.config.database.imessage_db_path);
-        info!("💾 State DB: {:?}", self.config.state.state_db_path);
-        info!("🔍 Detection types: {:?}", self.config.detection.deletion_types);
-        // Start the event stream
-        let mut event_stream = Box::pin(self.event_processor.start().await);
+        info!("Monitoring: {:?}", self.config.database.imessage_db_path);
+        info!("State DB: {:?}", self.config.state.state_db_path);
+        info!("Detection types: {:?}", self.config.detection.deletion_types);
+        
+        // Start the event stream - take ownership of event_processor to avoid borrow issues
+        let mut event_processor = std::mem::replace(&mut self.event_processor, EventProcessor::new(self.config.database.clone()));
+        let mut event_stream = Box::pin(event_processor.start().await);
+        
         // Process events as they arrive  
         while let Some(event) = event_stream.next().await {
             if let Err(e) = self.handle_event(event).await {
@@ -68,7 +72,7 @@ impl DeletionTracker {
 
         // Cleanup
         self.output_manager.write().await.finalize().await?;
-        info!("🏁 Deletion tracker stopped gracefully");
+        info!("Deletion tracker stopped gracefully");
 
         Ok(())
     }
@@ -77,22 +81,26 @@ impl DeletionTracker {
     async fn handle_event(&self, event: DatabaseEvent) -> Result<(), Box<dyn std::error::Error>> {
         match &event {
             DatabaseEvent::MessagesModified(message_ids) => {
-                info!("🔄 Processing {} modified messages", message_ids.len());
+                info!("Processing {} modified messages", message_ids.len());
                 
-                // Simplified detection for now - would use full detection engine in production
-
-                // For now, simplify by handling the detection inline
-                // This is a simplified approach - in production you'd want a more sophisticated design
-                let deletions: Vec<crate::core::state_manager::DeletionRecord> = Vec::new(); // Placeholder for now
+                // Use the detection engine to find deletions
+                let context = crate::core::detection_engine::DetectionContext {
+                    config: self.config.detection.clone(),
+                    state_manager: self.state_manager.clone(),
+                };
+                
+                let deletions = self.detection_engine.process_event(&event, &context).await
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?;
                 
                 // Process each deletion
                 for deletion in deletions {
-                    info!("🚨 Deletion detected: Message {}", 
+                    info!("Deletion detected: Message {}", 
                           deletion.message_id);
                     
                     // Store deletion record
                     let deletion_id = self.state_manager.write().await
-                        .store_deletion(&deletion).await?;
+                        .store_deletion(&deletion).await
+                        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?;
                     
                     // Send to output handlers
                     let mut deletion_with_id = deletion;
@@ -105,11 +113,11 @@ impl DeletionTracker {
             DatabaseEvent::TransactionComplete { wal_size, timestamp } => {
                 // Periodic housekeeping could go here
                 if wal_size % 1000000 == 0 { // Log every 1MB of WAL changes
-                    info!("📈 WAL size: {} bytes at {:?}", wal_size, timestamp);
+                    info!("WAL size: {} bytes at {:?}", wal_size, timestamp);
                 }
             }
             DatabaseEvent::MonitoringError(error) => {
-                error!("⚠️ Monitoring error: {}", error);
+                error!("Monitoring error: {}", error);
                 // Could implement reconnection logic here
             }
             _ => {
@@ -156,12 +164,12 @@ impl ShutdownHandler {
     /// Handle graceful shutdown
     pub async fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tracker) = self.tracker.take() {
-            info!("🛑 Initiating graceful shutdown...");
+            info!("Initiating graceful shutdown...");
             
             // Finalize output handlers
             tracker.output_manager.write().await.finalize().await?;
             
-            info!("✅ Shutdown completed successfully");
+            info!("Shutdown completed successfully");
         }
         Ok(())
     }

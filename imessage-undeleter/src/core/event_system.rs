@@ -138,7 +138,7 @@ impl EventProcessor {
     }
 
     /// Start the event processing system
-    pub async fn start(&mut self) -> impl StreamExt<Item = DatabaseEvent> {
+    pub async fn start(&mut self) -> impl StreamExt<Item = DatabaseEvent> + use<'_> {
         info!("Starting event-driven database monitoring...");
         self.wal_monitor.start_monitoring().await
     }

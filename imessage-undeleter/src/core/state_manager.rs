@@ -41,7 +41,7 @@ pub struct StateManager {
 
 impl StateManager {
     /// Create a new state manager and initialize the database
-    pub async fn new(config: StateConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(config: StateConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let conn = Connection::open(&config.state_db_path)?;
         
         let manager = Self { config, conn };
@@ -86,7 +86,7 @@ impl StateManager {
     }
 
     /// Store a message fingerprint
-    pub async fn store_fingerprint(&self, fingerprint: &MessageFingerprint) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn store_fingerprint(&self, fingerprint: &MessageFingerprint) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let attachment_hashes_json = serde_json::to_string(&fingerprint.attachment_hashes)?;
         
         self.conn.execute(
@@ -108,7 +108,7 @@ impl StateManager {
     }
 
     /// Get a stored fingerprint by message ID
-    pub async fn get_fingerprint(&self, message_id: i32) -> Result<Option<MessageFingerprint>, Box<dyn std::error::Error>> {
+    pub async fn get_fingerprint(&self, message_id: i32) -> Result<Option<MessageFingerprint>, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare(
             "SELECT message_id, content_hash, attachment_hashes, timestamp, conversation_id, sender_handle
              FROM message_fingerprints WHERE message_id = ?1"
@@ -137,7 +137,7 @@ impl StateManager {
     }
 
     /// Store a deletion record
-    pub async fn store_deletion(&self, deletion: &DeletionRecord) -> Result<i64, Box<dyn std::error::Error>> {
+    pub async fn store_deletion(&self, deletion: &DeletionRecord) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let fingerprint_json = serde_json::to_string(&deletion.original_fingerprint)?;
         let attachments_json = serde_json::to_string(&deletion.recovered_attachments)?;
 
@@ -162,7 +162,7 @@ impl StateManager {
     }
 
     /// Get all deletion records within a time range
-    pub async fn get_deletions_in_range(&self, start_time: i64, end_time: i64) -> Result<Vec<DeletionRecord>, Box<dyn std::error::Error>> {
+    pub async fn get_deletions_in_range(&self, start_time: i64, end_time: i64) -> Result<Vec<DeletionRecord>, Box<dyn std::error::Error + Send + Sync>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, message_id, original_fingerprint, deletion_timestamp, deletion_type, recovered_content, recovered_attachments
              FROM deletion_records 
@@ -201,7 +201,7 @@ impl StateManager {
     }
 
     /// Batch store multiple fingerprints efficiently
-    pub async fn batch_store_fingerprints(&self, fingerprints: &[MessageFingerprint]) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn batch_store_fingerprints(&self, fingerprints: &[MessageFingerprint]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tx = self.conn.unchecked_transaction()?;
         
         {

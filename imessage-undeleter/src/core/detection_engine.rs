@@ -27,14 +27,14 @@ pub trait DeletionDetector: Send + Sync {
         message_id: i32,
         current_state: Option<&MessageFingerprint>,
         previous_state: Option<&MessageFingerprint>,
-        context: &DetectionContext<'_>,
+        context: &DetectionContext,
     ) -> Result<Option<DetectionResult>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Context provided to detectors
 pub struct DetectionContext<'a> {
     pub config: DetectionConfig,
-    pub state_manager: &'a StateManager,
+    pub state_manager: std::sync::Arc<tokio::sync::RwLock<StateManager>>,
 }
 
 /// Result of deletion detection
@@ -51,6 +51,7 @@ pub struct DetectionResult {
 pub struct DetectionEngine {
     detectors: Vec<Box<dyn DeletionDetector>>,
     config: DetectionConfig,
+    db_path: std::path::PathBuf,
 }
 
 impl DetectionEngine {
@@ -68,14 +69,21 @@ impl DetectionEngine {
 
         info!("Initialized detection engine with {} detectors", detectors.len());
         
-        Self { detectors, config }
+        let db_path = std::path::PathBuf::from("");
+        
+        Self { detectors, config, db_path }
+    }
+    
+    pub fn with_db_path(mut self, db_path: std::path::PathBuf) -> Self {
+        self.db_path = db_path;
+        self
     }
 
     /// Process a database event and detect any deletions
     pub async fn process_event(
         &self,
         event: &DatabaseEvent,
-        context: &DetectionContext<'_>,
+        context: &DetectionContext,
     ) -> Result<Vec<DeletionRecord>, Box<dyn std::error::Error + Send + Sync>> {
         match event {
             DatabaseEvent::MessagesModified(message_ids) => {
@@ -88,22 +96,39 @@ impl DetectionEngine {
     async fn analyze_message_changes(
         &self,
         message_ids: &[i32],
-        context: &DetectionContext<'_>,
+        context: &DetectionContext,
     ) -> Result<Vec<DeletionRecord>, Box<dyn std::error::Error + Send + Sync>> {
         let mut deletion_records = Vec::new();
 
         for &message_id in message_ids {
             // Get current and previous state
-            let previous_state = context.state_manager.get_fingerprint(message_id).await?;
+            let previous_state = context.state_manager.read().await.get_fingerprint(message_id).await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?;
             let current_state = self.build_current_fingerprint(message_id).await?;
 
             // Run all detectors
+            // Filter detectors that require config checks first
+            let should_run_partial_edit = context.config.track_edits_as_deletions;
+            
             for detector in &self.detectors {
+                // Skip PartialEditDetector if config says not to track edits
+                if detector.name() == "PartialEdit" && !should_run_partial_edit {
+                    continue;
+                }
+                
+                // Clone Arc to avoid Send issues
+                let state_mgr = context.state_manager.clone();
+                let cfg = context.config.clone();
+                let safe_context = DetectionContext {
+                    config: cfg,
+                    state_manager: state_mgr,
+                };
+                
                 match detector.detect_deletion(
                     message_id,
                     current_state.as_ref(),
                     previous_state.as_ref(),
-                    context,
+                    &safe_context,
                 ).await {
                     Ok(Some(result)) => {
                         if true { // Always accept detections
@@ -146,20 +171,76 @@ impl DetectionEngine {
                 }
             }
 
-            // Update the fingerprint for future comparisons
-            if let Some(current) = current_state {
-                context.state_manager.store_fingerprint(&current).await?;
+            if let Some(current) = &current_state {
+                context.state_manager.write().await.store_fingerprint(current).await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?;
+            } else if previous_state.is_some() {
+                let deleted_fp = MessageFingerprint {
+                    message_id,
+                    content_hash: "deleted".to_string(),
+                    attachment_hashes: vec![],
+                    timestamp: chrono::Utc::now().timestamp(),
+                    conversation_id: None,
+                    sender_handle: None,
+                };
+                context.state_manager.write().await.store_fingerprint(&deleted_fp).await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?;
+            } else {
+                if let Some(current) = &current_state {
+                    context.state_manager.write().await.store_fingerprint(current).await
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))) })?;
+                }
             }
         }
 
         Ok(deletion_records)
     }
 
-    async fn build_current_fingerprint(&self, _message_id: i32) -> Result<Option<MessageFingerprint>, Box<dyn std::error::Error + Send + Sync>> {
-        // This would query the current iMessage database to build a fingerprint
-        // Implementation depends on your database access layer
-        // For now, returning None as placeholder
-        Ok(None)
+    async fn build_current_fingerprint(&self, message_id: i32) -> Result<Option<MessageFingerprint>, Box<dyn std::error::Error + Send + Sync>> {
+        use rusqlite::Connection;
+        use crate::core::state_manager::StateManager;
+        
+        let conn = Connection::open(&self.db_path)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { 
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to open DB: {}", e))) 
+            })?;
+        
+        let mut stmt = conn.prepare(
+            "SELECT ROWID, text, date, date_edited, cache_has_attachments, handle_id
+             FROM message WHERE ROWID = ?"
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { 
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("SQL error: {}", e))) 
+        })?;
+        
+        let result = stmt.query_row([message_id], |row| {
+            let text: Option<String> = row.get(1)?;
+            let date: i64 = row.get(2)?;
+            let _date_edited: Option<i64> = row.get(3)?;
+            let has_attachments: i32 = row.get(4)?;
+            let handle_id: Option<i32> = row.get(5)?;
+            
+            let content_hash = if let Some(ref t) = text {
+                StateManager::hash_content(t)
+            } else {
+                "empty".to_string()
+            };
+            
+            Ok(MessageFingerprint {
+                message_id,
+                content_hash,
+                attachment_hashes: if has_attachments != 0 { vec!["has_attachment".to_string()] } else { vec![] },
+                timestamp: date / 1_000_000_000,
+                conversation_id: None,
+                sender_handle: handle_id.map(|h| h.to_string()),
+            })
+        });
+        
+        match result {
+            Ok(fp) => Ok(Some(fp)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None), // Message doesn't exist
+            Err(e) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Query error: {}", e))) as Box<dyn std::error::Error + Send + Sync>),
+        }
     }
 }
 
@@ -181,28 +262,31 @@ impl DeletionDetector for FullMessageDeletionDetector {
         _message_id: i32,
         current_state: Option<&MessageFingerprint>,
         previous_state: Option<&MessageFingerprint>,
-        _context: &DetectionContext<'_>,
+        _context: &DetectionContext,
     ) -> Result<Option<DetectionResult>, Box<dyn std::error::Error + Send + Sync>> {
         match (previous_state, current_state) {
             (Some(prev), None) => {
-                // Message existed before but doesn't now - likely deleted
                 Ok(Some(DetectionResult {
                     deletion_type: DeletionType::FullMessage,
-
-                    recovered_content: Some("Full message content".to_string()), // Would extract from prev
+                    recovered_content: Some(format!("Message {} was fully deleted", prev.message_id)),
                     recovered_attachments: prev.attachment_hashes.clone(),
                     metadata: HashMap::new(),
                 }))
             }
-            (Some(prev), Some(curr)) if prev.content_hash != curr.content_hash => {
-                // Content changed - might be an edit or deletion
-                Ok(Some(DetectionResult {
-                    deletion_type: DeletionType::FullMessage,
-
-                    recovered_content: Some("Modified content".to_string()),
-                    recovered_attachments: vec![],
-                    metadata: HashMap::new(),
-                }))
+            // Message existed before and still exists, but content was deleted
+            (Some(prev), Some(curr)) => {
+                // If previous had content but current is empty/deleted, it's a deletion
+                if prev.content_hash != "empty" && prev.content_hash != "deleted" 
+                    && (curr.content_hash == "empty" || curr.content_hash == "deleted") {
+                    Ok(Some(DetectionResult {
+                        deletion_type: DeletionType::FullMessage,
+                        recovered_content: Some(format!("Message {} content was deleted", prev.message_id)),
+                        recovered_attachments: prev.attachment_hashes.clone(),
+                        metadata: HashMap::new(),
+                    }))
+                } else {
+                    Ok(None)
+                }
             }
             _ => Ok(None),
         }
@@ -227,7 +311,7 @@ impl DeletionDetector for AttachmentDeletionDetector {
         _message_id: i32,
         current_state: Option<&MessageFingerprint>,
         previous_state: Option<&MessageFingerprint>,
-        _context: &DetectionContext<'_>,
+        _context: &DetectionContext,
     ) -> Result<Option<DetectionResult>, Box<dyn std::error::Error + Send + Sync>> {
         match (previous_state, current_state) {
             (Some(prev), Some(curr)) => {
@@ -274,20 +358,14 @@ impl DeletionDetector for PartialEditDetector {
         _message_id: i32,
         current_state: Option<&MessageFingerprint>,
         previous_state: Option<&MessageFingerprint>,
-        context: &DetectionContext<'_>,
+        _context: &DetectionContext,
     ) -> Result<Option<DetectionResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if !context.config.track_edits_as_deletions {
-            return Ok(None);
-        }
 
         match (previous_state, current_state) {
             (Some(prev), Some(curr)) => {
                 if prev.content_hash != curr.content_hash {
-                    // This is a simplified heuristic - in practice you'd do more sophisticated
-                    // text diff analysis to determine if content was removed vs. just changed
                     Ok(Some(DetectionResult {
                         deletion_type: DeletionType::PartialEdit,
-
                         recovered_content: Some("Content changed".to_string()),
                         recovered_attachments: vec![],
                         metadata: HashMap::new(),

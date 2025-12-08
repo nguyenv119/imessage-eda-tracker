@@ -206,7 +206,6 @@ impl OutputHandler for SqliteOutputHandler {
                 deletion.message_id,
                 deletion.deletion_timestamp,
                 &deletion.deletion_type,
-                deletion.confidence,
                 &deletion.recovered_content,
                 attachments_json,
                 fingerprint_json,
@@ -307,12 +306,11 @@ impl TerminalOutputHandler {
         match self.format {
             TerminalFormat::Plain => {
                 format!(
-                    "DELETION DETECTED: Message {} deleted at {} (confidence: {:.2})\nContent: {}\nAttachments: {:?}",
+                    "DELETION DETECTED: Message {} deleted at {}\nContent: {}\nAttachments: {:?}",
                     deletion.message_id,
                     chrono::DateTime::from_timestamp(deletion.deletion_timestamp, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "Unknown".to_string()),
-                    deletion.confidence,
                     deletion.recovered_content.as_deref().unwrap_or("[No content]"),
                     deletion.recovered_attachments
                 )
@@ -322,14 +320,12 @@ impl TerminalOutputHandler {
                     "\x1b[31m🚨 DELETION DETECTED\x1b[0m\n\
                      \x1b[36m📱 Message ID:\x1b[0m {}\n\
                      \x1b[36m⏰ Timestamp:\x1b[0m {}\n\
-                     \x1b[36m🎯 Confidence:\x1b[0m {:.2}\n\
                      \x1b[36m📝 Content:\x1b[0m {}\n\
                      \x1b[36m📎 Attachments:\x1b[0m {:?}",
                     deletion.message_id,
                     chrono::DateTime::from_timestamp(deletion.deletion_timestamp, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "Unknown".to_string()),
-                    deletion.confidence,
                     deletion.recovered_content.as_deref().unwrap_or("[No content]"),
                     deletion.recovered_attachments
                 )
