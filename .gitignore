@@ -1,3 +1,5 @@
 target/
 undeleted_messages/
 LOGFILE.html
+tracker_state.db
+deletions.json
